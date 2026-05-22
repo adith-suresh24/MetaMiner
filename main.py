@@ -1,437 +1,304 @@
-#!/usr/bin/env python3
-"""
-MetaMiner - Extract and analyze file metadata for securityAI.
-Supports: PDF, Office (docx/xlsx/pptx), images (jpg/png/tiff), executables (PE),
-archives (zip), audio (mp3), video (mp4).
-"""
-
 import os
 import sys
 import json
+import csv
 import hashlib
-import zipfile
+import argparse
+import mimetypes
+import struct
+import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, List
 
-# ---- Metadata extraction libraries ----
+# ------------------------------
+# EXTERNAL LIBRARIES
+# ------------------------------
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS, GPSTAGS
+except ImportError:
+    Image = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
+
 try:
     import PyPDF2
 except ImportError:
     PyPDF2 = None
 
 try:
-    from docx import Document
+    from mutagen import File as MutagenFile
 except ImportError:
-    Document = None
+    MutagenFile = None
 
-try:
-    from openpyxl import load_workbook
-except ImportError:
-    load_workbook = None
+# ------------------------------
+# CORE UTILITIES
+# ------------------------------
 
-try:
-    from pptx import Presentation
-except ImportError:
-    Presentation = None
+class HashingEngine:
+    @staticmethod
+    def generate_hashes(file_path: str) -> Dict[str, str]:
+        """Generates MD5, SHA1, and SHA256 hashes for a file."""
+        md5_hash = hashlib.md5()
+        sha1_hash = hashlib.sha1()
+        sha256_hash = hashlib.sha256()
 
-try:
-    from PIL import Image
-    from PIL.ExifTags import TAGS
-except ImportError:
-    Image = None
-
-try:
-    import pefile
-except ImportError:
-    pefile = None
-
-try:
-    import magic
-except ImportError:
-    magic = None
-
-try:
-    import exifread
-except ImportError:
-    exifread = None
-
-try:
-    import mutagen
-    from mutagen.mp3 import MP3
-    from mutagen.mp4 import MP4
-    from mutagen.flac import FLAC
-except ImportError:
-    mutagen = None
-
-# Optional: hachoir for deep metadata (supports many formats)
-try:
-    from hachoir.parser import createParser
-    from hachoir.metadata import extractMetadata
-except ImportError:
-    createParser = None
-    extractMetadata = None
-
-
-class MetaMiner:
-    """Extract and analyze metadata from a given file."""
-
-    # Suspicious patterns for security analysis
-    SUSPICIOUS_PDF_KEYWORDS = ["/JavaScript", "/JS", "/Launch", "/OpenAction"]
-    SUSPICIOUS_OFFICE_MACROS = ["ThisDocument", "Module", "VBA"]
-    SUSPICIOUS_TIMESTAMPS = ["1970-01-01", "1601-01-01"]
-
-    def __init__(self, file_path: Union[str, Path], calculate_hash: bool = True):
-        """
-        Args:
-            file_path: Path to the file to analyze.
-            calculate_hash: Whether to compute SHA256 and MD5 hashes.
-        """
-        self.file_path = Path(file_path)
-        self.calculate_hash = calculate_hash
-
-        if not self.file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        self.mime_type = self._get_mime_type()
-
-    def _get_mime_type(self) -> str:
-        """Detect MIME type using python-magic or fallback to extension."""
-        if magic:
-            try:
-                return magic.from_file(str(self.file_path), mime=True)
-            except Exception:
-                pass
-        # Fallback: guess by extension
-        ext = self.file_path.suffix.lower()
-        mime_map = {
-            ".pdf": "application/pdf",
-            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".tiff": "image/tiff",
-            ".exe": "application/x-msdownload",
-            ".dll": "application/x-msdownload",
-            ".zip": "application/zip",
-            ".mp3": "audio/mpeg",
-            ".mp4": "video/mp4",
-        }
-        return mime_map.get(ext, "application/octet-stream")
-
-    def extract_all(self) -> Dict[str, Any]:
-        """Extract all available metadata and run security analysis."""
-        result = {
-            "file_path": str(self.file_path),
-            "file_size": self.file_path.stat().st_size,
-            "mime_type": self.mime_type,
-            "hashes": {},
-            "metadata": {},
-            "security_analysis": {},
-        }
-
-        # Hashes
-        if self.calculate_hash:
-            result["hashes"] = self._compute_hashes()
-
-        # Metadata extraction based on MIME type
-        if self.mime_type == "application/pdf":
-            result["metadata"] = self._extract_pdf_metadata()
-        elif self.mime_type.startswith("application/vnd.openxmlformats"):
-            result["metadata"] = self._extract_office_metadata()
-        elif self.mime_type.startswith("image/"):
-            result["metadata"] = self._extract_image_metadata()
-        elif self.mime_type in ("application/x-msdownload", "application/x-dosexec"):
-            result["metadata"] = self._extract_pe_metadata()
-        elif self.mime_type == "application/zip":
-            result["metadata"] = self._extract_zip_metadata()
-        elif self.mime_type.startswith("audio/"):
-            result["metadata"] = self._extract_audio_metadata()
-        elif self.mime_type.startswith("video/"):
-            result["metadata"] = self._extract_video_metadata()
-        else:
-            # Fallback: try hachoir if available
-            result["metadata"] = self._extract_hachoir_metadata()
-
-        # Security analysis
-        result["security_analysis"] = self._analyze_security(result["metadata"])
-
-        return result
-
-    def _compute_hashes(self) -> Dict[str, str]:
-        """Compute SHA256 and MD5 hashes of the file."""
-        sha256 = hashlib.sha256()
-        md5 = hashlib.md5()
-        with open(self.file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                sha256.update(chunk)
-                md5.update(chunk)
-        return {"sha256": sha256.hexdigest(), "md5": md5.hexdigest()}
-
-    # ----- PDF Metadata -----
-    def _extract_pdf_metadata(self) -> Dict[str, Any]:
-        if not PyPDF2:
-            return {"error": "PyPDF2 not installed"}
         try:
-            with open(self.file_path, "rb") as f:
+            with open(file_path, "rb") as f:
+                # Read in chunks to handle large files efficiently
+                for chunk in iter(lambda: f.read(4096), b""):
+                    md5_hash.update(chunk)
+                    sha1_hash.update(chunk)
+                    sha256_hash.update(chunk)
+            
+            return {
+                "MD5": md5_hash.hexdigest(),
+                "SHA1": sha1_hash.hexdigest(),
+                "SHA256": sha256_hash.hexdigest()
+            }
+        except Exception as e:
+            return {"Error": str(e)}
+
+class FileAnalyzer:
+    @staticmethod
+    def get_file_stats(file_path: str) -> Dict[str, Any]:
+        """Retrieves basic OS-level file statistics."""
+        try:
+            stats = os.stat(file_path)
+            return {
+                "size": stats.st_size,
+                "created": datetime.fromtimestamp(stats.st_ctime).isoformat(),
+                "modified": datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                "accessed": datetime.fromtimestamp(stats.st_atime).isoformat()
+            }
+        except Exception as e:
+            return {"Error": str(e)}
+
+    @staticmethod
+    def detect_type(file_path: str) -> Dict[str, str]:
+        """Detects MIME type and extension."""
+        mime_type, encoding = mimetypes.guess_type(file_path)
+        
+        # Fallback for files without extensions or unknown types
+        if not mime_type:
+            try:
+                # Simple signature check (magic bytes)
+                with open(file_path, 'rb') as f:
+                    header = f.read(8)
+                    if header.startswith(b'\x89PNG'):
+                        mime_type = "image/png"
+                    elif header.startswith(b'\xff\xd8\xff'):
+                        mime_type = "image/jpeg"
+                    elif header.startswith(b'PK\x03\x04'):
+                        mime_type = "application/zip" # Could also be docx/xlsx
+                    else:
+                        mime_type = "application/octet-stream"
+            except:
+                mime_type = "unknown"
+
+        return {
+            "mime_type": mime_type,
+            "encoding": encoding,
+            "extension": Path(file_path).suffix
+        }
+
+# ------------------------------
+# EXTRACTORS
+# ------------------------------
+
+class ImageExtractor:
+    @staticmethod
+    def extract(file_path: str) -> Dict:
+        data = {"format": "Unknown", "meta": {}}
+        if not Image:
+            return data
+        
+        try:
+            img = Image.open(file_path)
+            data["format"] = img.format
+            data["meta"]["resolution"] = img.size
+            data["meta"]["mode"] = img.mode
+            
+            # EXIF Data
+            exif_data = img._getexif()
+            if exif_data:
+                for tag, value in exif_data.items():
+                    tag_name = TAGS.get(tag, tag)
+                    if tag_name == "GPSInfo":
+                        gps_data = {}
+                        for t in value:
+                            gps_tag = GPSTAGS.get(t, t)
+                            gps_data[gps_tag] = value[t]
+                        data["meta"]["gps"] = gps_data
+                    else:
+                        data["meta"][tag_name] = str(value)
+        except Exception as e:
+            data["Error"] = str(e)
+        return data
+
+class DocxExtractor:
+    @staticmethod
+    def extract(file_path: str) -> Dict:
+        data = {"meta": {}}
+        if not docx:
+            return data
+        
+        try:
+            d = docx.Document(file_path)
+            core_props = d.core_properties
+            data["meta"]["author"] = core_props.author
+            data["meta"]["last_modified_by"] = core_props.last_modified_by
+            data["meta"]["created"] = str(core_props.created)
+            data["meta"]["modified"] = str(core_props.modified)
+            data["meta"]["title"] = core_props.title
+            data["meta"]["application"] = core_props.application
+        except Exception as e:
+            data["Error"] = str(e)
+        return data
+
+class PdfExtractor:
+    @staticmethod
+    def extract(file_path: str) -> Dict:
+        data = {"meta": {}}
+        if not PyPDF2:
+            return data
+            
+        try:
+            with open(file_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
                 meta = reader.metadata
                 if meta:
-                    return {k[1:].lower(): v for k, v in meta.items()}
-                return {"page_count": len(reader.pages), "encrypted": reader.is_encrypted}
+                    data["meta"]["author"] = meta.get('/Author')
+                    data["meta"]["creator"] = meta.get('/Creator')
+                    data["meta"]["producer"] = meta.get('/Producer')
+                    data["meta"]["creation_date"] = str(meta.get('/CreationDate'))
+                    data["meta"]["mod_date"] = str(meta.get('/ModDate'))
+                data["meta"]["pages"] = len(reader.pages)
         except Exception as e:
-            return {"error": str(e)}
-
-    # ----- Office Metadata -----
-    def _extract_office_metadata(self) -> Dict[str, Any]:
-        data = {}
-        # Word
-        if "wordprocessingml" in self.mime_type and Document:
-            try:
-                doc = Document(self.file_path)
-                core_props = doc.core_properties
-                data = {
-                    "author": core_props.author,
-                    "last_modified_by": core_props.last_modified_by,
-                    "created": str(core_props.created),
-                    "modified": str(core_props.modified),
-                    "revision": core_props.revision,
-                }
-            except Exception:
-                pass
-        # Excel
-        elif "spreadsheetml" in self.mime_type and load_workbook:
-            try:
-                wb = load_workbook(self.file_path, read_only=True, data_only=False)
-                props = wb.properties
-                data = {
-                    "creator": props.creator,
-                    "last_modified_by": props.lastModifiedBy,
-                    "created": str(props.created),
-                    "modified": str(props.modified),
-                    "title": props.title,
-                }
-            except Exception:
-                pass
-        # PowerPoint
-        elif "presentationml" in self.mime_type and Presentation:
-            try:
-                prs = Presentation(self.file_path)
-                core_props = prs.core_properties
-                data = {
-                    "author": core_props.author,
-                    "last_modified_by": core_props.last_modified_by,
-                    "created": str(core_props.created),
-                    "modified": str(core_props.modified),
-                }
-            except Exception:
-                pass
+            data["Error"] = str(e)
         return data
 
-    # ----- Image Metadata (EXIF, IPTC) -----
-    def _extract_image_metadata(self) -> Dict[str, Any]:
-        data = {}
-        if Image:
-            try:
-                img = Image.open(self.file_path)
-                data["format"] = img.format
-                data["mode"] = img.mode
-                data["size"] = img.size
-                exif = img.getexif()
-                if exif:
-                    for tag_id, value in exif.items():
-                        tag_name = TAGS.get(tag_id, tag_id)
-                        data[tag_name] = str(value)
-            except Exception:
-                pass
-        if exifread and not data:
-            # Alternative exifread
-            try:
-                with open(self.file_path, "rb") as f:
-                    tags = exifread.process_file(f)
-                for tag, value in tags.items():
-                    data[tag] = str(value)
-            except Exception:
-                pass
+class MediaExtractor:
+    @staticmethod
+    def extract(file_path: str) -> Dict:
+        data = {"meta": {}}
+        if not MutagenFile:
+            return data
+            
+        try:
+            audio = MutagenFile(file_path)
+            if audio:
+                # Common tags
+                tags = audio.tags if audio.tags else {}
+                data["meta"]["format"] = audio.info.pprint() if hasattr(audio.info, 'pprint') else str(type(audio.info))
+                data["meta"]["length"] = str(audio.info.length) + " seconds"
+                
+                if tags:
+                    data["meta"]["artist"] = tags.get("artist", ["N/A"])[0]
+                    data["meta"]["title"] = tags.get("title", ["N/A"])[0]
+                    data["meta"]["date"] = tags.get("date", ["N/A"])[0]
+        except Exception as e:
+            data["Error"] = str(e)
         return data
 
-    # ----- PE (Windows Executable) Metadata -----
-    def _extract_pe_metadata(self) -> Dict[str, Any]:
-        if not pefile:
-            return {"error": "pefile not installed"}
-        try:
-            pe = pefile.PE(self.file_path)
-            data = {}
-            # DOS header
-            data["e_magic"] = hex(pe.DOS_HEADER.e_magic)
-            data["e_lfanew"] = pe.DOS_HEADER.e_lfanew
-            # File header
-            data["machine"] = hex(pe.FILE_HEADER.Machine)
-            data["number_of_sections"] = pe.FILE_HEADER.NumberOfSections
-            data["time_date_stamp"] = datetime.fromtimestamp(pe.FILE_HEADER.TimeDateStamp).isoformat() if pe.FILE_HEADER.TimeDateStamp else None
-            # Optional header
-            if hasattr(pe, "OPTIONAL_HEADER"):
-                data["image_base"] = hex(pe.OPTIONAL_HEADER.ImageBase)
-                data["entry_point"] = hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint)
-                data["subsystem"] = pe.OPTIONAL_HEADER.Subsystem
-            # Sections
-            data["sections"] = [sec.Name.decode().strip("\x00") for sec in pe.sections]
-            # Imports
-            imports = []
-            if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-                for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                    imports.append(entry.dll.decode())
-            data["imported_dlls"] = imports
-            pe.close()
-            return data
-        except Exception as e:
-            return {"error": str(e)}
+# ------------------------------
+# MAIN ENGINE
+# ------------------------------
 
-    # ----- ZIP Archive Metadata -----
-    def _extract_zip_metadata(self) -> Dict[str, Any]:
-        data = {}
-        try:
-            with zipfile.ZipFile(self.file_path, "r") as zf:
-                infos = zf.infolist()
-                data["num_files"] = len(infos)
-                data["compressed_size"] = sum(f.compress_size for f in infos)
-                data["file_names"] = [f.filename for f in infos[:10]]  # first 10
-                data["is_encrypted"] = any(f.flag_bits & 0x1 for f in infos)
-        except Exception as e:
-            data["error"] = str(e)
-        return data
+class MetadataEngine:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.report = {}
 
-    # ----- Audio Metadata -----
-    def _extract_audio_metadata(self) -> Dict[str, Any]:
-        if not mutagen:
-            return {}
-        try:
-            if self.file_path.suffix.lower() == ".mp3":
-                audio = MP3(self.file_path)
-            elif self.file_path.suffix.lower() == ".mp4":
-                audio = MP4(self.file_path)
-            elif self.file_path.suffix.lower() == ".flac":
-                audio = FLAC(self.file_path)
-            else:
-                return {}
-            data = {"length_seconds": audio.info.length, "bitrate": audio.info.bitrate}
-            # Tags
-            for k, v in audio.items():
-                data[k] = str(v)
-            return data
-        except Exception as e:
-            return {"error": str(e)}
+    def analyze(self) -> Dict[str, Any]:
+        # 1. Basic File Info
+        self.report["file_name"] = Path(self.file_path).name
+        self.report["file_stats"] = FileAnalyzer.get_file_stats(self.file_path)
+        self.report["file_type"] = FileAnalyzer.detect_type(self.file_path)
+        
+        # 2. Hashes
+        self.report["hashes"] = HashingEngine.generate_hashes(self.file_path)
+        
+        # 3. Specific Metadata
+        self.report["metadata"] = {}
+        f_type = self.report["file_type"]["mime_type"]
+        
+        if "image" in f_type:
+            self.report["metadata"] = ImageExtractor.extract(self.file_path)
+        elif "pdf" in f_type:
+            self.report["metadata"] = PdfExtractor.extract(self.file_path)
+        elif "wordprocessingml" in f_type or "docx" in f_type: # crude check
+            self.report["metadata"] = DocxExtractor.extract(self.file_path)
+        elif "audio" in f_type or "video" in f_type:
+            self.report["metadata"] = MediaExtractor.extract(self.file_path)
 
-    # ----- Video Metadata -----
-    def _extract_video_metadata(self) -> Dict[str, Any]:
-        # Currently same as audio (mutagen also works for mp4 video)
-        return self._extract_audio_metadata()
+        # 4. Indicators (Heuristics)
+        self.report["indicators"] = self._check_indicators()
+        
+        return self.report
 
-    # ----- Fallback: hachoir parser (very broad support) -----
-    def _extract_hachoir_metadata(self) -> Dict[str, Any]:
-        if not createParser or not extractMetadata:
-            return {"note": "Install hachoir for deep metadata extraction"}
-        try:
-            parser = createParser(str(self.file_path))
-            if not parser:
-                return {}
-            metadata = extractMetadata(parser)
-            if not metadata:
-                return {}
-            data = {}
-            for line in metadata.exportPlaintext():
-                if ":" in line:
-                    key, val = line.split(":", 1)
-                    data[key.strip()] = val.strip()
-            parser.stream.close()
-            return data
-        except Exception as e:
-            return {"error": str(e)}
+    def _check_indicators(self) -> List[str]:
+        ind = []
+        # Check GPS
+        meta = self.report.get("metadata", {})
+        if meta.get("meta", {}).get("gps"):
+            ind.append("GPS Data Present")
+        
+        stats = self.report.get("file_stats", {})
+        mod = datetime.fromisoformat(stats.get("modified"))
+        create = datetime.fromisoformat(stats.get("created"))
+        
+        # Suspicious: Modified before created (logic might vary by OS)
+        if mod < create:
+            ind.append("Timestamp Anomaly (Mod < Create)")
+            
+        return ind
 
-    # ----- Security Analysis -----
-    def _analyze_security(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Look for suspicious indicators in extracted metadata."""
-        issues = []
+# ------------------------------
+# USER INTERFACE (CLI)
+# ------------------------------
 
-        # PDF JavaScript
-        if self.mime_type == "application/pdf":
-            for kw in self.SUSPICIOUS_PDF_KEYWORDS:
-                if any(kw in str(v) for v in metadata.values()):
-                    issues.append(f"Contains suspicious PDF keyword: {kw}")
+def print_report_json(report):
+    print(json.dumps(report, indent=4))
 
-        # Office macros
-        if self.mime_type.startswith("application/vnd.openxmlformats"):
-            # Quick check: look for vbaProject.bin in zip
-            try:
-                with zipfile.ZipFile(self.file_path, "r") as zf:
-                    for name in zf.namelist():
-                        if "vbaProject.bin" in name.lower():
-                            issues.append("Contains VBA macros (potential malware)")
-                            break
-            except Exception:
-                pass
-
-        # Suspicious timestamps (e.g., zero dates)
-        for key, val in metadata.items():
-            if isinstance(val, str) and val.startswith(tuple(self.SUSPICIOUS_TIMESTAMPS)):
-                issues.append(f"Suspicious timestamp in {key}: {val}")
-
-        # PE file anomalies
-        if self.mime_type in ("application/x-msdownload", "application/x-dosexec"):
-            if "entry_point" in metadata:
-                ep = metadata["entry_point"]
-                if ep and ep.lower() == "0x0":
-                    issues.append("Entry point at zero – suspicious")
-            if "sections" in metadata and len(metadata["sections"]) > 10:
-                issues.append("Unusually many sections (packer?)")
-
-        # Overly recent file? (future date)
-        now = datetime.now()
-        for key, val in metadata.items():
-            if "date" in key.lower() and isinstance(val, str):
-                try:
-                    dt = datetime.fromisoformat(val.replace("Z", ""))
-                    if dt > now:
-                        issues.append(f"File timestamp in future: {key} = {val}")
-                except Exception:
-                    pass
-
-        return {
-            "suspicious_indicators": issues,
-            "risk_score": len(issues) * 10,  # simple scoring
-        }
-
-
-# ----- Command Line Interface -----
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="MetaMiner - Extract and analyze file metadata for securityAI.")
-    parser.add_argument("file", help="Path to the file to analyze")
-    parser.add_argument("--no-hash", action="store_true", help="Skip hash calculation")
-    parser.add_argument("--output", "-o", help="Output JSON file (otherwise print to stdout)")
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
-    args = parser.parse_args()
-
-    try:
-        miner = MetaMiner(args.file, calculate_hash=not args.no_hash)
-        result = miner.extract_all()
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if args.output:
-        with open(args.output, "w") as f:
-            json.dump(result, f, indent=2 if args.pretty else None, default=str)
-        print(f"Results written to {args.output}")
+def print_report_text(report):
+    print("="*40)
+    print(f"FILE METADATA REPORT: {report.get('file_name')}")
+    print("="*40)
+    
+    print("\n--- FILE IDENTIFICATION ---")
+    print(f"Type: {report['file_type'].get('mime_type')}")
+    print(f"Extension: {report['file_type'].get('extension')}")
+    
+    print("\n--- TIMESTAMPS ---")
+    print(f"Created: {report['file_stats'].get('created')}")
+    print(f"Modified: {report['file_stats'].get('modified')}")
+    print(f"Accessed: {report['file_stats'].get('accessed')}")
+    
+    print("\n--- HASHES ---")
+    for h, val in report['hashes'].items():
+        print(f"{h}: {val}")
+        
+    print("\n--- EMBEDDED METADATA ---")
+    meta = report.get('metadata', {}).get('meta', {})
+    if not meta:
+        print("No specific metadata found.")
     else:
-        if args.pretty:
-            print(json.dumps(result, indent=2, default=str))
-        else:
-            print(json.dumps(result, default=str))
+        for k, v in meta.items():
+            print(f"{k}: {v}")
+            
+    print("\n--- SECURITY INDICATORS ---")
+    ind = report.get('indicators', [])
+    if not ind:
+        print("None detected.")
+    else:
+        for i in ind:
+            print(f"[!] {i}")
 
-
-if __name__ == "__main__":
-    main()
+def save_csv(reports, filename="metadata_report.csv"):
+    if not reports: return
+    keys = reports[0

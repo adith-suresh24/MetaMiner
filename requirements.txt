@@ -1,0 +1,10 @@
+PyPDF2
+python-docx
+openpyxl
+python-pptx
+pillow
+pefile
+python-machete
+exifread
+mutagen
+hachoir
